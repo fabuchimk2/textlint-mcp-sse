@@ -1,436 +1,439 @@
-# textlint MCP SSE対応の修正計画
+# textlint MCP Streamable HTTP対応の修正計画
 
 ## 現状分析
 
-### 既存実装
-textlintは現在、Model Context Protocol (MCP) サーバーとして以下の構成で実装されています：
+### 既存実装の詳細
 
-- **トランスポート**: stdio (標準入出力) のみ
-- **起動方法**: `npx textlint --mcp`
-- **実装ファイル**:
-  - `packages/textlint/src/mcp/server.ts` - MCPサーバーの実装
-  - `packages/textlint/src/mcp/schemas.ts` - データ構造と型定義
+textlintのMCP実装を実際に確認した結果：
 
-### 制限事項
+**使用しているSDK**:
+- `@modelcontextprotocol/sdk` version `^1.21.1`
+- 公式のMCP TypeScript SDKを使用
+
+**実装ファイル**:
+- `packages/textlint/src/mcp/server.ts` - MCPサーバーの実装
+  - `setupServer()`: `McpServer`インスタンスを作成し、4つのツール（lintFile, lintText, getLintFixedFileContent, getLintFixedTextContent）を登録
+  - `connectStdioMcpServer()`: `StdioServerTransport`を使用してstdio経由で接続
+- `packages/textlint/src/mcp/schemas.ts` - Zodスキーマ定義
+- `packages/textlint/src/cli.ts` - CLIエントリポイント
+  - `--mcp`フラグで`connectStdioMcpServer()`を呼び出す（80-96行目）
+
+**既存のアーキテクチャの特徴**:
+- トランスポート層は既にMCP SDKレベルで抽象化されている
+- `McpServer`クラスは`StdioServerTransport`に依存していない
+- サーバーのセットアップ（ツール登録）とトランスポート接続が分離されている
+
+### 現在の制限事項
+
 - stdio transportのみのため、ローカル環境でのプロセス間通信に限定される
 - Webアプリケーションやリモート接続からの利用ができない
 - HTTP/HTTPSベースのクライアントとの通信ができない
 
-## SSE対応の目的
+## Streamable HTTP対応の目的
+
+### 重要な発見: SSEの非推奨化
+
+調査の結果、MCPプロトコルの重要な変更を発見しました：
+
+- **SSE transportは2024-11-05に非推奨**となりました
+- **Streamable HTTP transport**に置き換えられました（MCP仕様 2025-03-26版）
+- TypeScript SDK version 1.10.0+（2025年4月17日リリース）でサポート
+- textlintが使用している`@modelcontextprotocol/sdk@^1.21.1`は対応済み
+
+### Streamable HTTPの特徴
+
+1. **HTTPベースの双方向通信**
+   - クライアント→サーバー: HTTP POST
+   - サーバー→クライアント: HTTP レスポンス（オプションでSSEストリーミング）
+
+2. **セッション管理**
+   - `Mcp-Session-Id`ヘッダーによるセッション識別
+   - ステートレスモードとステートフルモードの両方をサポート
+
+3. **セキュリティ**
+   - DNS rebinding protection
+   - 標準的なHTTP認証・認可メカニズムを利用可能
 
 ### メリット
+
 1. **Webアプリケーション対応**: ブラウザベースのエディタやWebアプリケーションから利用可能
 2. **リモートアクセス**: ネットワーク経由でのtextlintサービスの提供が可能
 3. **柔軟な配信**: クラウド環境やコンテナ環境での配信が容易
 4. **標準的なHTTP通信**: ファイアウォールやプロキシを通過しやすい
-
-### SSE (Server-Sent Events) の特徴
-- HTTPベースの一方向ストリーミング（サーバー→クライアント）
-- クライアントからのリクエストはHTTP POSTで送信
-- リアルタイム更新が必要なアプリケーションに適している
-- WebSocketよりもシンプルな実装
-
-## 技術的要件
-
-### 1. トランスポート層の抽象化
-現在の実装は恐らくstdioに直接依存しているため、トランスポート層を抽象化する必要があります。
-
-```typescript
-interface Transport {
-  send(message: any): Promise<void>;
-  receive(): AsyncIterator<any>;
-  close(): Promise<void>;
-}
-
-class StdioTransport implements Transport { ... }
-class SSETransport implements Transport { ... }
-```
-
-### 2. HTTPサーバーの実装
-SSE用のHTTPサーバーを実装する必要があります。
-
-**必要な機能**:
-- HTTP POSTエンドポイント（クライアント→サーバー）
-- SSEエンドポイント（サーバー→クライアント）
-- CORS対応
-- 認証・認可（オプション）
-
-**候補ライブラリ**:
-- `express` - 軽量で実績のあるWebフレームワーク
-- `fastify` - 高速なWebフレームワーク
-- Node.js標準の `http` モジュール
-
-### 3. SSEプロトコルの実装
-SSEの仕様に準拠した実装が必要です。
-
-**SSEフォーマット**:
-```
-data: {"type":"message","content":"..."}\n\n
-```
-
-**実装要件**:
-- Content-Type: `text/event-stream`
-- Connection: `keep-alive`
-- Cache-Control: `no-cache`
+5. **スケーラビリティ**: ロードバランサーやリバースプロキシとの統合が容易
 
 ## 修正が必要な箇所
 
-### 1. ディレクトリ構造の拡張
+### 既存コードの分析結果
 
-```
-packages/textlint/src/mcp/
-├── server.ts           # 既存（要修正）
-├── schemas.ts          # 既存（変更なし or 軽微な修正）
-├── transports/         # 新規ディレクトリ
-│   ├── index.ts        # Transport interface定義
-│   ├── stdio.ts        # Stdio transport実装
-│   └── sse.ts          # SSE transport実装
-└── http-server.ts      # 新規: HTTPサーバー実装
-```
+MCP SDKが既にトランスポート層を抽象化しているため、実装は非常にシンプルになります：
 
-### 2. server.ts の修正
+1. **変更不要**: `server.ts`の`setupServer()`関数
+   - 既に`McpServer`を返しているので、そのまま再利用可能
 
-**変更内容**:
-- トランスポートをコンストラクタで注入できるように変更
-- stdio特有のコードをStdioTransportクラスに移動
-- トランスポート非依存なコアロジックとして再構成
+2. **変更不要**: `schemas.ts`
+   - データ構造の定義は変更なし
 
-**修正例**:
-```typescript
-// Before
-export class MCPServer {
-  constructor(private options: MCPServerOptions) {
-    // stdioに直接依存
-  }
-}
+3. **新規作成**: HTTP/Expressサーバーの実装
 
-// After
-export class MCPServer {
-  constructor(
-    private transport: Transport,
-    private options: MCPServerOptions
-  ) {
-    // トランスポート非依存
-  }
-}
-```
+4. **修正**: `cli.ts`でのトランスポート選択ロジック
 
-### 3. 新規ファイル: transports/index.ts
+### 実装方針の大幅な変更
 
-トランスポート層のインターフェース定義。
+**当初の計画**: トランスポート層を独自に抽象化し、独自のSSETransportクラスを実装
+**修正後の計画**: MCP SDK提供の`StreamableHTTPServerTransport`を使用
+
+これにより、実装の複雑さが大幅に削減されます。
+
+## 実装の詳細
+
+### 1. 新規ファイル: `packages/textlint/src/mcp/http-server.ts`
+
+MCP SDK提供の`StreamableHTTPServerTransport`を使用したHTTPサーバー実装。
 
 ```typescript
-export interface Transport {
-  // メッセージの送信
-  send(message: any): Promise<void>;
+import express, { Request, Response } from "express";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { setupServer, type McpServerOptions } from "./server.js";
+import debug from "debug";
 
-  // メッセージの受信（非同期イテレータ）
-  receive(): AsyncIterator<any>;
+const httpDebug = debug("textlint:mcp:http");
 
-  // 接続のクローズ
-  close(): Promise<void>;
-
-  // イベントリスナー
-  on(event: 'error', listener: (error: Error) => void): void;
-  on(event: 'close', listener: () => void): void;
+export interface HttpServerOptions extends McpServerOptions {
+    port?: number;
+    host?: string;
+    enableCors?: boolean;
 }
 
-export abstract class BaseTransport implements Transport {
-  // 共通実装
-}
-```
+export const startHttpServer = async (options: HttpServerOptions = {}): Promise<void> => {
+    const app = express();
+    const port = options.port ?? 3000;
+    const host = options.host ?? "0.0.0.0";
 
-### 4. 新規ファイル: transports/stdio.ts
+    // Middleware
+    app.use(express.json());
 
-既存のstdio実装をクラスとして分離。
-
-```typescript
-import { BaseTransport } from './index';
-
-export class StdioTransport extends BaseTransport {
-  constructor() {
-    super();
-  }
-
-  async send(message: any): Promise<void> {
-    process.stdout.write(JSON.stringify(message) + '\n');
-  }
-
-  async *receive(): AsyncIterator<any> {
-    const readline = require('readline');
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-      terminal: false
-    });
-
-    for await (const line of rl) {
-      yield JSON.parse(line);
+    // CORS設定（オプション）
+    if (options.enableCors) {
+        app.use((req, res, next) => {
+            res.header("Access-Control-Allow-Origin", "*");
+            res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            res.header("Access-Control-Allow-Headers", "Content-Type, Mcp-Session-Id");
+            if (req.method === "OPTIONS") {
+                res.sendStatus(200);
+                return;
+            }
+            next();
+        });
     }
-  }
 
-  async close(): Promise<void> {
-    // cleanup
-  }
-}
-```
+    // MCP Serverをセットアップ（ツール登録）
+    // setupServer()は既存のコードをそのまま使用
+    const mcpServer = await setupServer(options);
 
-### 5. 新規ファイル: transports/sse.ts
-
-SSEトランスポートの実装。
-
-```typescript
-import { BaseTransport } from './index';
-import type { Request, Response } from 'express';
-
-export class SSETransport extends BaseTransport {
-  private messageQueue: any[] = [];
-  private response?: Response;
-
-  constructor(private req: Request, private res: Response) {
-    super();
-    this.setupSSE();
-  }
-
-  private setupSSE(): void {
-    this.res.setHeader('Content-Type', 'text/event-stream');
-    this.res.setHeader('Cache-Control', 'no-cache');
-    this.res.setHeader('Connection', 'keep-alive');
-    this.res.setHeader('Access-Control-Allow-Origin', '*');
-    this.res.flushHeaders();
-  }
-
-  async send(message: any): Promise<void> {
-    const data = JSON.stringify(message);
-    this.res.write(`data: ${data}\n\n`);
-  }
-
-  async *receive(): AsyncIterator<any> {
-    // メッセージキューから取得
-    while (true) {
-      if (this.messageQueue.length > 0) {
-        yield this.messageQueue.shift();
-      } else {
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
+    if (options.debug) {
+        httpDebug("MCP HTTP server initialized");
     }
-  }
 
-  // POSTリクエストからメッセージを追加
-  addMessage(message: any): void {
-    this.messageQueue.push(message);
-  }
+    // ステートレスモード: 各リクエストごとに新しいトランスポートを作成
+    app.post("/mcp", async (req: Request, res: Response) => {
+        try {
+            if (options.debug) {
+                httpDebug("Received MCP request");
+            }
 
-  async close(): Promise<void> {
-    this.res.end();
-  }
-}
-```
+            // 新しいトランスポートを作成
+            const transport = new StreamableHTTPServerTransport({
+                sessionIdGenerator: undefined, // ステートレスモード
+                enableJsonResponse: true
+            });
 
-### 6. 新規ファイル: http-server.ts
+            // レスポンスがクローズされたらトランスポートもクローズ
+            res.on("close", () => {
+                transport.close();
+            });
 
-HTTPサーバーの実装。
+            // サーバーをトランスポートに接続
+            await mcpServer.connect(transport);
 
-```typescript
-import express from 'express';
-import { MCPServer } from './server';
-import { SSETransport } from './transports/sse';
+            // リクエストを処理
+            await transport.handleRequest(req, res, req.body);
 
-export interface HTTPServerOptions {
-  port: number;
-  host?: string;
-  cors?: boolean;
-}
-
-export class MCPHTTPServer {
-  private app: express.Application;
-  private sessions: Map<string, SSETransport> = new Map();
-
-  constructor(private options: HTTPServerOptions) {
-    this.app = express();
-    this.setupMiddleware();
-    this.setupRoutes();
-  }
-
-  private setupMiddleware(): void {
-    this.app.use(express.json());
-
-    if (this.options.cors) {
-      this.app.use((req, res, next) => {
-        res.header('Access-Control-Allow-Origin', '*');
-        res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-        res.header('Access-Control-Allow-Headers', 'Content-Type');
-        next();
-      });
-    }
-  }
-
-  private setupRoutes(): void {
-    // SSEエンドポイント（サーバー→クライアント）
-    this.app.get('/sse', (req, res) => {
-      const sessionId = req.query.sessionId as string;
-      const transport = new SSETransport(req, res);
-      this.sessions.set(sessionId, transport);
-
-      const mcpServer = new MCPServer(transport, {});
-      mcpServer.start();
-
-      req.on('close', () => {
-        this.sessions.delete(sessionId);
-        transport.close();
-      });
+            if (options.debug) {
+                httpDebug("MCP request handled successfully");
+            }
+        } catch (error) {
+            httpDebug("Error handling MCP request:", error);
+            if (!res.headersSent) {
+                res.status(500).json({
+                    jsonrpc: "2.0",
+                    error: {
+                        code: -32603,
+                        message: "Internal server error"
+                    },
+                    id: null
+                });
+            }
+        }
     });
 
-    // メッセージ送信エンドポイント（クライアント→サーバー）
-    this.app.post('/message', (req, res) => {
-      const sessionId = req.body.sessionId;
-      const message = req.body.message;
-
-      const transport = this.sessions.get(sessionId);
-      if (transport) {
-        transport.addMessage(message);
-        res.json({ success: true });
-      } else {
-        res.status(404).json({ error: 'Session not found' });
-      }
+    // ヘルスチェックエンドポイント
+    app.get("/health", (req: Request, res: Response) => {
+        res.json({
+            status: "ok",
+            service: "textlint-mcp",
+            transport: "streamable-http"
+        });
     });
 
-    // ヘルスチェック
-    this.app.get('/health', (req, res) => {
-      res.json({ status: 'ok' });
-    });
-  }
-
-  async start(): Promise<void> {
-    const { port, host = '0.0.0.0' } = this.options;
-
+    // サーバー起動
     return new Promise((resolve) => {
-      this.app.listen(port, host, () => {
-        console.log(`MCP HTTP Server listening on http://${host}:${port}`);
-        resolve();
-      });
+        app.listen(port, host, () => {
+            console.log(`textlint MCP server listening on http://${host}:${port}/mcp`);
+            if (options.debug) {
+                httpDebug(`Server started on http://${host}:${port}`);
+            }
+            resolve();
+        });
     });
-  }
-}
+};
 ```
 
-### 7. CLIの拡張
+### 2. `packages/textlint/src/cli.ts` の修正
 
-textlintのCLI引数を拡張して、トランスポートモードを選択できるようにします。
+CLIオプションを拡張して、Streamable HTTPモードを選択できるようにします。
 
-**修正ファイル**: `packages/textlint/src/cli.ts` (または該当するCLIエントリポイント)
-
-**新規オプション**:
-```bash
-# 従来のstdio mode
-npx textlint --mcp
-
-# SSE mode
-npx textlint --mcp --transport sse --port 3000
-
-# または簡潔に
-npx textlint --mcp-sse --port 3000
-```
-
-**実装例**:
+**追加するオプション**:
 ```typescript
-// CLI引数パース部分
-const args = parseArgs(process.argv);
+// options.tsに追加
+{
+    option: "mcp-http",
+    type: "Boolean",
+    default: false,
+    description: "Start textlint as MCP server with Streamable HTTP transport"
+},
+{
+    option: "mcp-port",
+    type: "Number",
+    default: 3000,
+    description: "Port number for MCP HTTP server (used with --mcp-http)"
+},
+{
+    option: "mcp-host",
+    type: "String",
+    default: "0.0.0.0",
+    description: "Host address for MCP HTTP server (used with --mcp-http)"
+},
+{
+    option: "mcp-cors",
+    type: "Boolean",
+    default: false,
+    description: "Enable CORS for MCP HTTP server (used with --mcp-http)"
+}
+```
 
-if (args.mcp) {
-  const transport = args.transport || 'stdio';
+**cli.tsの修正**:
+```typescript
+// cli.ts内（80行目付近）
+} else if (currentOptions.mcp) {
+    // Map CLI options to MCP server options
+    const mcpOptions: McpServerOptions = {
+        configFilePath: currentOptions.config,
+        node_modulesDir: currentOptions.rulesBaseDirectory,
+        ignoreFilePath: currentOptions.ignorePath,
+        quiet: currentOptions.quiet,
+        debug: currentOptions.debug,
+        cwd: process.cwd()
+    };
 
-  if (transport === 'stdio') {
-    const transport = new StdioTransport();
-    const server = new MCPServer(transport, options);
-    await server.start();
-  } else if (transport === 'sse') {
-    const httpServer = new MCPHTTPServer({
-      port: args.port || 3000,
-      host: args.host || '0.0.0.0',
-      cors: args.cors !== false
+    const mcpServer = await connectStdioMcpServer(mcpOptions);
+    process.on("SIGINT", () => {
+        mcpServer.close();
+        process.exitCode = 0;
     });
-    await httpServer.start();
+    return 0;
+} else if (currentOptions.mcpHttp) {
+    // 新規追加: Streamable HTTP mode
+    const { startHttpServer } = await import("./mcp/http-server.js");
+
+    const httpOptions: HttpServerOptions = {
+        configFilePath: currentOptions.config,
+        node_modulesDir: currentOptions.rulesBaseDirectory,
+        ignoreFilePath: currentOptions.ignorePath,
+        quiet: currentOptions.quiet,
+        debug: currentOptions.debug,
+        cwd: process.cwd(),
+        port: currentOptions.mcpPort,
+        host: currentOptions.mcpHost,
+        enableCors: currentOptions.mcpCors
+    };
+
+    await startHttpServer(httpOptions);
+
+    // Graceful shutdown
+    process.on("SIGINT", () => {
+        console.log("\nShutting down MCP HTTP server...");
+        process.exit(0);
+    });
+
+    // Keep the process running
+    return new Promise(() => {});
+}
+```
+
+### 3. `packages/textlint/src/options.ts` の修正
+
+新しいCLIオプションを追加します。
+
+```typescript
+// 既存のoptions配列に追加
+{
+    option: "mcp-http",
+    type: "Boolean",
+    default: false,
+    description: "Start textlint as MCP server with Streamable HTTP transport"
+},
+{
+    option: "mcp-port",
+    type: "Number",
+    default: 3000,
+    description: "Port number for MCP HTTP server (default: 3000)"
+},
+{
+    option: "mcp-host",
+    type: "String",
+    default: "0.0.0.0",
+    description: "Host address for MCP HTTP server (default: 0.0.0.0)"
+},
+{
+    option: "mcp-cors",
+    type: "Boolean",
+    default: false,
+    description: "Enable CORS for MCP HTTP server"
+}
+```
+
+## 使用方法
+
+### stdio mode（既存）
+
+```bash
+npx textlint --mcp
+```
+
+### Streamable HTTP mode（新規）
+
+```bash
+# デフォルト設定（ポート3000、全インターフェースでリッスン）
+npx textlint --mcp-http
+
+# ポート指定
+npx textlint --mcp-http --mcp-port 8080
+
+# ホスト指定
+npx textlint --mcp-http --mcp-host localhost
+
+# CORS有効化
+npx textlint --mcp-http --mcp-cors
+
+# 設定ファイルと組み合わせ
+npx textlint --mcp-http --config .textlintrc.json --mcp-port 3000
+
+# デバッグモード
+DEBUG=textlint:mcp:* npx textlint --mcp-http --debug
+```
+
+### クライアント設定例
+
+#### Claude Code (.claude/mcp.json)
+```json
+{
+  "mcpServers": {
+    "textlint": {
+      "transport": "streamable-http",
+      "url": "http://localhost:3000/mcp"
+    }
   }
 }
+```
+
+#### HTTPクライアントからの利用例
+```bash
+# ヘルスチェック
+curl http://localhost:3000/health
+
+# lintFileツールの実行
+curl -X POST http://localhost:3000/mcp \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "tools/call",
+    "params": {
+      "name": "lintFile",
+      "arguments": {
+        "filePaths": ["README.md"]
+      }
+    },
+    "id": 1
+  }'
 ```
 
 ## 実装ステップ
 
-### Phase 1: 基盤整備（トランスポート層の抽象化）
+### Phase 1: 基本実装（最小限の機能）
 
-1. **Transportインターフェースの定義**
-   - `transports/index.ts` を作成
-   - Transport interfaceとBaseTransportクラスを実装
+1. **依存関係の追加**
+   ```bash
+   cd packages/textlint
+   pnpm add express
+   pnpm add -D @types/express
+   ```
 
-2. **StdioTransportの実装**
-   - `transports/stdio.ts` を作成
-   - 既存のstdio処理をクラスに移行
+2. **http-server.tsの実装**
+   - ステートレスモードのみ
+   - 基本的なエンドポイント（/mcp, /health）
 
-3. **server.tsのリファクタリング**
-   - トランスポートをコンストラクタインジェクションに変更
-   - 既存機能が引き続き動作することを確認
+3. **options.tsとcli.tsの修正**
+   - 新しいCLIオプションの追加
+   - HTTPサーバー起動ロジックの追加
 
-4. **テストの実装**
-   - StdioTransportのユニットテスト
-   - 既存のE2Eテストが通ることを確認
+4. **動作確認**
+   - ローカルでのHTTPサーバー起動テスト
+   - curlでの基本的なリクエストテスト
 
-### Phase 2: SSE実装
+### Phase 2: テストとドキュメント
 
-5. **HTTPサーバーの実装**
-   - `http-server.ts` を作成
-   - Express (またはFastify) のセットアップ
-   - 基本的なルーティング実装
-
-6. **SSETransportの実装**
-   - `transports/sse.ts` を作成
-   - SSEプロトコルの実装
-   - メッセージキューの実装
-
-7. **セッション管理の実装**
-   - セッションIDの生成と管理
-   - タイムアウト処理
-   - 接続の監視とクリーンアップ
-
-8. **テストの実装**
-   - SSETransportのユニットテスト
+5. **テストの実装**
    - HTTPサーバーの統合テスト
-   - E2Eテスト
+   - エンドポイントの動作テスト
+   - エラーハンドリングのテスト
 
-### Phase 3: CLI統合
+6. **ドキュメント更新**
+   - `docs/mcp.md`の更新
+   - Streamable HTTP transportの使用方法追加
+   - クライアント設定例の追加
+   - README.mdの更新
 
-9. **CLI引数の拡張**
-   - `--transport` オプションの追加
-   - `--port`, `--host`, `--cors` オプションの追加
-   - ヘルプメッセージの更新
+### Phase 3: 高度な機能（オプション）
 
-10. **設定ファイルのサポート** (オプション)
-    - `.textlintrc` でのトランスポート設定
-    - 環境変数からの設定読み込み
+7. **セッション管理の実装**（必要に応じて）
+   - ステートフルモードのサポート
+   - セッションIDの管理
+   - タイムアウト処理
 
-11. **ドキュメント更新**
-    - README.mdの更新
-    - docs/mcp.mdの更新
-    - 使用例の追加
+8. **セキュリティ強化**
+   - 認証機能の追加（Bearer token等）
+   - レート制限
+   - DNS rebinding protection の有効化
 
-### Phase 4: 最適化と追加機能
-
-12. **パフォーマンス最適化**
-    - メッセージバッファリング
-    - 圧縮の検討
-
-13. **セキュリティ強化**
-    - 認証機能の追加（Bearer token等）
-    - レート制限
-    - 入力検証の強化
-
-14. **モニタリング**
-    - ログ出力の充実
-    - メトリクスの収集（接続数、処理時間等）
+9. **モニタリング**
+   - ログ出力の充実
+   - メトリクスの収集
 
 ## 依存関係の追加
 
-package.jsonに以下の依存関係を追加する必要があります：
+`packages/textlint/package.json`に以下を追加：
 
 ```json
 {
@@ -438,88 +441,209 @@ package.jsonに以下の依存関係を追加する必要があります：
     "express": "^4.18.2"
   },
   "devDependencies": {
-    "@types/express": "^4.17.17",
-    "supertest": "^6.3.3",
-    "@types/supertest": "^2.0.12"
+    "@types/express": "^4.17.21"
   }
 }
 ```
 
-## 設定例
+**注**: `@modelcontextprotocol/sdk@^1.21.1`は既に存在するため、追加不要です。
 
-### エディタ設定（SSE mode）
+## ディレクトリ構造
 
-#### VS Code (.vscode/mcp.json)
-```json
-{
-  "mcpServers": {
-    "textlint-sse": {
-      "type": "sse",
-      "url": "http://localhost:3000/sse"
-    }
-  }
-}
 ```
-
-#### Claude Code (.claude/mcp.json)
-```json
-{
-  "mcpServers": {
-    "textlint-sse": {
-      "transport": "sse",
-      "url": "http://localhost:3000",
-      "endpoints": {
-        "sse": "/sse",
-        "message": "/message"
-      }
-    }
-  }
-}
+packages/textlint/src/
+├── mcp/
+│   ├── server.ts          # 既存（変更なし）
+│   ├── schemas.ts         # 既存（変更なし）
+│   └── http-server.ts     # 新規: Streamable HTTP実装
+├── cli.ts                 # 修正: HTTPモード追加
+└── options.ts             # 修正: 新規オプション追加
 ```
-
-## 互換性の維持
-
-- 既存のstdio modeは引き続きサポート（デフォルト）
-- `--mcp` フラグは従来通りstdio modeで動作
-- 新しいSSE modeは明示的に `--transport sse` で指定
 
 ## テスト戦略
 
 ### ユニットテスト
-- 各Transportクラスの単体テスト
-- HTTPサーバーのルーティングテスト
-- セッション管理のテスト
 
-### 統合テスト
-- stdio modeとSSE modeの両方でのE2Eテスト
-- 実際のtextlintルールを使用したテスト
+- HTTPサーバーのセットアップテスト
+- エンドポイントのルーティングテスト
 - エラーハンドリングのテスト
 
-### パフォーマンステスト
-- 大量のメッセージ送受信のテスト
-- 複数の同時接続のテスト
-- メモリリークのチェック
+### 統合テスト
+
+```typescript
+import { describe, it, expect } from "vitest";
+import request from "supertest";
+import express from "express";
+
+describe("MCP HTTP Server", () => {
+  it("should respond to health check", async () => {
+    // テストの実装
+  });
+
+  it("should handle lintFile request", async () => {
+    const response = await request(app)
+      .post("/mcp")
+      .send({
+        jsonrpc: "2.0",
+        method: "tools/call",
+        params: {
+          name: "lintFile",
+          arguments: {
+            filePaths: ["test.md"]
+          }
+        },
+        id: 1
+      });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toHaveProperty("result");
+  });
+});
+```
+
+### E2Eテスト
+
+- 実際のHTTPクライアントからのリクエスト
+- stdio modeとHTTP modeの両方での動作確認
+- 複数の同時リクエストの処理
+
+## セキュリティ考慮事項
+
+### 開発環境での使用
+
+デフォルト設定はローカル開発向け：
+- CORS無効
+- 認証なし
+- デバッグログ有効可能
+
+### 本番環境での推奨設定
+
+本番環境で使用する場合は以下を推奨：
+
+1. **認証の実装**
+   ```typescript
+   app.use((req, res, next) => {
+     const token = req.headers.authorization?.replace("Bearer ", "");
+     if (!isValidToken(token)) {
+       res.status(401).json({ error: "Unauthorized" });
+       return;
+     }
+     next();
+   });
+   ```
+
+2. **HTTPS化**
+   - リバースプロキシ（nginx, Caddy等）でTLS終端
+   - または、Expressにhttpsモジュールを統合
+
+3. **レート制限**
+   ```typescript
+   import rateLimit from "express-rate-limit";
+
+   const limiter = rateLimit({
+     windowMs: 15 * 60 * 1000, // 15分
+     max: 100 // 100リクエスト/15分
+   });
+
+   app.use("/mcp", limiter);
+   ```
+
+4. **DNS rebinding protection**
+   ```typescript
+   const transport = new StreamableHTTPServerTransport({
+     sessionIdGenerator: undefined,
+     enableJsonResponse: true,
+     dnsRebindingProtection: {
+       enabled: true,
+       allowedHosts: ["textlint.example.com"]
+     }
+   });
+   ```
+
+## 互換性の維持
+
+- **既存のstdio mode**: 完全に維持（デフォルト動作）
+- **既存のCLIオプション**: すべて互換性あり
+- **既存のツール**: 変更なし（lintFile, lintText等）
+- **設定ファイル**: 既存の.textlintrc等はそのまま使用可能
+
+## パフォーマンス考慮事項
+
+### ステートレス vs ステートフル
+
+**ステートレスモード**（推奨）:
+- メリット: シンプル、スケーラブル、メモリ効率的
+- デメリット: リクエストごとにサーバーセットアップのオーバーヘッド（ただし軽微）
+
+**ステートフルモード**（オプション）:
+- メリット: セッション維持、リクエスト間での状態共有
+- デメリット: メモリ使用量増加、セッション管理の複雑さ
+
+現在の実装ではステートレスモードを採用していますが、必要に応じてステートフルモードも実装可能です。
+
+### ベンチマーク目標
+
+- 1リクエストあたりの処理時間: < 100ms（小規模ファイル）
+- 同時接続数: 100+ リクエスト/秒
+- メモリ使用量: ベースライン + 数MB（リクエストあたり）
 
 ## リスクと対策
 
 ### リスク
-1. **下位互換性の破壊**: 既存のstdio実装の変更による影響
+
+1. **下位互換性の破壊**: なし（既存のstdio modeは完全に維持）
 2. **セキュリティ**: HTTPサーバーを公開することによるリスク
-3. **パフォーマンス**: SSEのオーバーヘッド
+3. **パフォーマンス**: HTTPオーバーヘッド
 
 ### 対策
-1. 徹底的なテストと段階的なリリース
-2. 認証機能の実装、CORS設定の適切な管理
-3. ベンチマークテストとプロファイリング
+
+1. stdio modeとHTTP modeを完全に分離（既存コードの変更最小限）
+2. 認証・認可機能の実装、CORS設定の適切な管理、デフォルトはローカルホストのみ
+3. ベンチマークテストとプロファイリング、必要に応じてキャッシング実装
+
+## マイグレーションパス
+
+既存ユーザーへの影響なし：
+
+1. **既存ユーザー**: `--mcp`で従来通りstdio modeを使用
+2. **新規ユーザー**: 用途に応じてstdio/HTTPを選択
+3. **段階的移行**: stdio → HTTPへの移行を任意のタイミングで実施可能
 
 ## 参考資料
 
-- [Model Context Protocol Specification](https://spec.modelcontextprotocol.io/)
-- [Server-Sent Events (MDN)](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)
+### MCP仕様とSDK
+- [Model Context Protocol Specification 2025-03-26](https://spec.modelcontextprotocol.io/)
+- [@modelcontextprotocol/sdk - npm](https://www.npmjs.com/package/@modelcontextprotocol/sdk)
+- [MCP TypeScript SDK GitHub](https://github.com/modelcontextprotocol/typescript-sdk)
+- [Why MCP Deprecated SSE and Went with Streamable HTTP](https://blog.fka.dev/blog/2025-06-06-why-mcp-deprecated-sse-and-go-with-streamable-http/)
+
+### 実装例
+- [mcp-streamable-http-typescript-server](https://github.com/ferrants/mcp-streamable-http-typescript-server)
+- [Deploy Remote MCP Servers with Streamable HTTP](https://www.koyeb.com/tutorials/deploy-remote-mcp-servers-to-koyeb-using-streamable-http-transport)
+
+### 関連技術
 - [Express.js Documentation](https://expressjs.com/)
+- [Server-Sent Events (MDN)](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)
 
 ## まとめ
 
-この修正計画では、textlintのMCP実装にSSE対応を追加するための包括的なアプローチを提示しました。トランスポート層を抽象化することで、既存のstdio実装を維持しながら、新しいSSE transportを追加できます。
+この修正計画では、textlintのMCP実装に**Streamable HTTP transport**対応を追加する方法を詳細に説明しました。
 
-実装は4つのフェーズに分けて進めることで、リスクを最小限に抑えながら段階的に機能を追加していくことができます。
+**主な発見と変更点**:
+
+1. **SSEは非推奨**: MCP仕様でSSE transportは非推奨となり、Streamable HTTPに置き換えられました
+
+2. **実装の簡素化**: MCP SDK（`@modelcontextprotocol/sdk@^1.21.1`）が既に`StreamableHTTPServerTransport`を提供しているため、独自のトランスポート実装は不要です
+
+3. **既存コードの活用**: `setupServer()`関数は変更不要で、そのまま再利用できます
+
+4. **最小限の変更**: 新しいHTTPサーバーファイル1つと、CLIオプションの追加のみで実装可能です
+
+**実装の優位性**:
+
+- 既存のstdio実装に一切影響なし
+- シンプルで保守しやすいコード
+- MCP公式SDKの機能をフル活用
+- 段階的な導入が可能
+
+実装は3つのフェーズに分けて進めることで、リスクを最小限に抑えながら確実に機能を追加できます。
